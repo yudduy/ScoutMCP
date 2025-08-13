@@ -1,121 +1,124 @@
-# Smithery Registry MCP Server
+# MCP Scout - Automated MCP Discovery and Integration
 
-An MCP server that interfaces with the Smithery Registry API, allowing AI agents to search for MCP servers, get server details, and create connection URLs.
+A FastMCP-based Python server that automates the discovery and installation of Model Context Protocol (MCP) servers using the Smithery Registry API.
 
-This server implements the functionality described in [llms.txt](https://smithery.ai/docs/registry/llms.txt), providing a programmatic way to search and obtain launch configurations for Model Context Protocol (MCP) servers.
+MCP Scout enables Claude Code to recommend MCPs based on project analysis, semantically search for matches using natural language queries, and automatically install them via system commands, streamlining developer workflows.
 
 ## Features
 
-- **Search for Servers**: Find MCP servers using semantic search or specific filters
-- **Get Server Details**: Retrieve detailed information about specific servers
-- **Create Connection URLs**: Generate correctly formatted WebSocket URLs with encoded configurations
+- **Semantic Search**: Find MCP servers using natural language queries (e.g., "python linter", "web search")
+- **Automated Installation**: Automatically install discovered MCPs using `claude mcp add` commands
+- **Intelligent Matching**: Select the best MCP from search results based on relevance
+- **Error Handling**: Comprehensive error handling for API failures and installation issues
+- **FastMCP Integration**: Built with FastMCP for seamless Claude Code integration
 
 ## Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/aloshy-ai/smithery-registry-mcp.git
-cd smithery-registry-mcp
+git clone https://github.com/your-username/mcp-scout.git
+cd mcp-scout
 
-# Install dependencies
-npm install
+# Install Python dependencies
+pip install -r requirements.txt
 
-# Build the project
-npm run build
+# Set your Smithery API key
+export SMITHERY_API_KEY=your_smithery_api_key
 ```
+
+### Prerequisites
+
+- Python 3.8+
+- Smithery API key (get one at [smithery.ai](https://smithery.ai))
+- Claude CLI installed (`claude mcp add` commands)
 
 ## Usage
 
 ### Start the Server
 
-You can run the server in two modes:
-
-**STDIO Mode** (default, for use with LLM clients):
+**STDIO Mode** (default, for use with Claude Code):
 ```bash
-npm start
+python server.py
 ```
 
-**SSE Mode** (for web applications):
-```bash
-npm run sse
+### Integration with Claude Code
+
+Add MCP Scout to your Claude Code configuration:
+
+```json
+{
+  "mcpServers": {
+    "mcp-scout": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["/path/to/mcp-scout/server.py"],
+      "env": {
+        "SMITHERY_API_KEY": "your_smithery_api_key"
+      }
+    }
+  }
+}
 ```
 
 ### Environment Variables
 
-- `PORT`: The port to listen on when running in SSE mode (default: 3000)
-- `HOST`: The host to bind to when running in SSE mode (default: localhost)
-- `ENDPOINT`: The endpoint path for SSE connections (default: /sse)
-- `USE_SSE`: Set to "true" to run in SSE mode instead of STDIO mode
+- `SMITHERY_API_KEY`: Your Smithery Registry API key (required)
 
-### Using the Server with Smithery CLI
+## MCP Scout Tools
 
-```bash
-# Install the server using Smithery CLI
-npx @smithery/cli install @aloshy-ai/smithery-registry-mcp
+### `find_mcp`
 
-# Use with various clients
-npx @smithery/cli run @aloshy-ai/smithery-registry-mcp --client claude
-```
+Finds the best-matching MCP server using semantic search.
 
-## API Tools
+**Parameters:**
+- `query` (string): Natural language description of desired MCP functionality
+  - Examples: "python linter", "web search", "database query", "code formatter"
 
-### `authenticate`
+**Returns:**
+- MCP information including name, description, install command, and metadata
+- Error message if no matches found or API call fails
 
-Set up authentication with your Smithery API key.
+### `find_and_install_mcp`
 
-Parameters:
-- `apiKey`: Your Smithery API key
+Finds and automatically installs the best-matching MCP server.
 
-### `listServers`
+**Parameters:**
+- `query` (string): Natural language description of desired MCP functionality
 
-Search and retrieve a list of servers from the Smithery Registry.
-
-Parameters:
-- `query` (optional): Search query (semantic search)
-- `page` (optional, default: 1): Page number for pagination
-- `pageSize` (optional, default: 10): Number of items per page
-
-### `getServer`
-
-Get detailed information about a specific server by its qualified name.
-
-Parameters:
-- `qualifiedName`: The qualified name of the server to get details for
-
-### `createConnectionUrl`
-
-Create a WebSocket connection URL for a server with the provided configuration.
-
-Parameters:
-- `qualifiedName`: The qualified name of the server
-- `config`: Configuration object matching the server's schema
+**Returns:**
+- Installation status (success/error)
+- MCP information and installation details  
+- Error details if installation fails
 
 ## Examples
 
-Here's how you might use this server with an AI assistant:
+### Core Workflow
 
-1. First authenticate with your API key:
+1. **Claude Code analyzes your project and recommends an MCP:**
 ```
-authenticate({ apiKey: "your-smithery-api-key" })
-```
-
-2. Search for servers related to a topic:
-```
-listServers({ query: "web search capabilities" })
+"This Python project needs a linter for code quality."
 ```
 
-3. Get detailed information about a specific server:
+2. **Find suitable MCP:**
+```python
+find_mcp("python linter")
 ```
-getServer({ qualifiedName: "brave-search" })
-```
+Returns information about Ruff or similar Python linting MCPs.
 
-4. Create a connection URL with the appropriate configuration:
+3. **Install the MCP automatically:**
+```python
+find_and_install_mcp("python linter")
 ```
-createConnectionUrl({
-  qualifiedName: "brave-search",
-  config: { apiKey: "your-brave-api-key" }
-})
-```
+Executes: `claude mcp add ruff-mcp -- npx -y @modelcontextprotocol/server-ruff`
+
+4. **Restart your terminal and use the new MCP**
+
+### Example Usage Scenarios
+
+- **"Add a web search capability"** → Finds and installs Brave Search MCP
+- **"Need database query tools"** → Finds and installs SQLite or PostgreSQL MCP  
+- **"Add code formatting"** → Finds and installs Prettier or Black formatter MCP
+- **"Need file system operations"** → Finds and installs filesystem MCP
 
 ## License
 

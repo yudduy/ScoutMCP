@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mcp-scout": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["/absolute/path/to/mcp-scout/server.py"],
+      "env": {
+        "SMITHERY_API_KEY": "your_smithery_api_key_here"
+      }
+    }
+  }
+}
