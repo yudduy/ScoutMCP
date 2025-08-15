@@ -128,6 +128,12 @@ async def find_mcp(query: str) -> Dict[str, Any]:
         Dictionary containing the best match with name, description, and install command,
         or an error message if no matches found or API call fails.
     """
+    # Validate query input
+    if not query or not query.strip():
+        return {
+            "error": "Query cannot be empty. Please provide a description of the desired MCP functionality."
+        }
+    
     api_key = os.getenv('SMITHERY_API_KEY')
     if not api_key:
         return {
@@ -249,225 +255,168 @@ async def find_and_install_mcp(query: str) -> Dict[str, Any]:
             "details": str(e)
         }
 
-# New models for codebase analysis
-class CodebaseAnalysis(BaseModel):
-    """Structure for codebase analysis results from Claude Code"""
-    languages: List[str] = Field(description="Programming languages detected")
-    frameworks: List[str] = Field(description="Frameworks and libraries identified")
-    project_type: str = Field(description="Type of project (web, cli, library, etc.)")
-    dependencies: Optional[List[str]] = Field(default=None, description="Key dependencies")
-    suggested_mcps: List[str] = Field(description="Natural language MCP suggestions")
+# Simple, explicit data models for MCP operations
+class SearchRequest(BaseModel):
+    """Simple search request for Smithery Registry"""
+    query: str = Field(description="Search term")
+    limit: int = Field(default=10, description="Maximum results to return")
+    filters: Optional[Dict[str, Any]] = Field(default=None, description="Optional Smithery API filters")
 
-class MCPRecommendation(BaseModel):
-    """MCP recommendation with relevance score"""
-    qualifiedName: str
-    displayName: str
+class MCPInfo(BaseModel):
+    """Basic MCP information"""
+    qualified_name: str
+    display_name: str
     description: str
-    relevance_score: float = Field(ge=0, le=1, description="Relevance score 0-1")
-    reason: str = Field(description="Why this MCP is recommended")
     install_command: str
+    homepage: Optional[str] = None
+    use_count: Optional[int] = None
+
+class InstallRequest(BaseModel):
+    """Installation request"""
+    qualified_name: str
+    install_command: Optional[str] = Field(default=None, description="Override install command")
+    timeout_seconds: int = Field(default=60, description="Installation timeout")
+
 
 @mcp.tool
 async def setup_mcp(query: Optional[str] = None, analysis: Optional[Any] = None) -> Dict[str, Any]:
     """
-    Discover, install, and verify an MCP in one step.
+    DEPRECATED: Use the new atomic tools instead: search_registry, install_mcp, verify_installation.
+    This tool will be removed in v2.0.
 
-    Args:
-        query: Natural language description of desired MCP functionality (e.g., "python linter").
-        analysis: Codebase analysis (object or JSON string) used to discover relevant MCPs.
-
-    Returns:
-        Dictionary with discovery result, installation status, and verification.
+    Simplified setup using new atomic operations.
     """
-    api_key = os.getenv('SMITHERY_API_KEY')
-    if not api_key:
+    # Deprecation warning
+    deprecation_msg = "⚠️  DEPRECATED: setup_mcp is deprecated. Use new atomic tools: search_registry, install_mcp, verify_installation"
+    
+    if not query:
+        return {
+            "status": "error", 
+            "error": "Provide a 'query' parameter. The 'analysis' parameter is deprecated.",
+            "deprecation_warning": deprecation_msg
+        }
+
+    # 1) Search using new atomic tool
+    search_result = await search_registry(query, limit=1)
+    if search_result.get("status") != "success" or not search_result.get("results"):
         return {
             "status": "error",
-            "error": "SMITHERY_API_KEY environment variable not set. If running via Claude Code, add it under env in claude_config.json and fully restart the app."
+            "error": f"No MCPs found for query: '{query}'",
+            "deprecation_warning": deprecation_msg
         }
-
-    if not query and analysis is None:
-        return {"status": "error", "error": "Provide either 'query' or 'analysis'"}
-
-    # 1) Discover target MCP
-    selected: Optional[Dict[str, Any]] = None
-
-    if query:
-        found = await find_mcp(query)
-        if "error" in found:
-            return {"status": "error", "error": found["error"]}
-        selected = found
-    else:
-        # Normalize analysis
-        try:
-            if isinstance(analysis, CodebaseAnalysis):
-                analysis_model = analysis
-            elif isinstance(analysis, dict):
-                analysis_model = CodebaseAnalysis(**analysis)
-            elif isinstance(analysis, str):
-                parsed = json.loads(analysis)
-                if not isinstance(parsed, dict):
-                    return {"status": "error", "error": "Invalid analysis payload: expected JSON object after parsing string"}
-                analysis_model = CodebaseAnalysis(**parsed)
-            else:
-                return {"status": "error", "error": "Invalid analysis payload: expected object or JSON string"}
-        except Exception as e:
-            return {"status": "error", "error": f"Failed to parse analysis payload: {str(e)}"}
-
-        recs = await discover_mcps(analysis_model)
-        if recs.get("status") != "success" or not recs.get("recommendations"):
-            return {"status": "error", "error": recs.get("error", "No recommendations found")}
-        top = recs["recommendations"][0]
-        selected = {
-            "name": top.get("displayName"),
-            "qualifiedName": top.get("qualifiedName"),
-            "description": top.get("description", ""),
-            "install_command": top.get("install_command")
-        }
-
-    if not selected or not selected.get("qualifiedName") or not selected.get("install_command"):
-        return {"status": "error", "error": "Discovery did not return a qualifiedName and install_command"}
-
-    qualified_name = selected["qualifiedName"]
-    install_command = selected["install_command"]
-
-    # 2) Install via Claude CLI
-    full_command = f"claude mcp add {qualified_name} -- {install_command}"
-    try:
-        result = subprocess.run(
-            full_command.split(),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        install_status = {
-            "status": "success",
-            "message": f"Installed {selected['name']} ({qualified_name}). Restart your terminal/Claude to use it.",
-            "install_command": full_command,
-            "details": result.stdout,
-        }
-    except subprocess.CalledProcessError as e:
+    
+    # Get top result
+    top_result = search_result["results"][0]
+    qualified_name = top_result["qualified_name"]
+    
+    # 2) Install using new atomic tool
+    install_result = await install_mcp(qualified_name)
+    if install_result.get("status") != "success":
         return {
             "status": "error",
-            "error": f"Installation failed for {selected.get('name', qualified_name)}",
-            "install_command": full_command,
-            "details": e.stderr
+            "error": install_result.get("message", "Installation failed"),
+            "deprecation_warning": deprecation_msg
         }
-    except subprocess.TimeoutExpired:
-        return {
-            "status": "error",
-            "error": f"Installation timed out for {selected.get('name', qualified_name)}",
-            "install_command": full_command,
-            "details": "Command exceeded 60 second timeout"
-        }
-
-    # 3) Verify config contains the MCP
-    verification = await check_mcp()
-    verified = False
-    if verification.get("status") == "success":
-        for entry in verification.get("installed_mcps", []):
-            entry_name = entry.get("name", "")
-            entry_args = " ".join(entry.get("args", []))
-            if entry_name == qualified_name or (qualified_name and qualified_name in entry_args):
-                verified = True
-                break
-
+    
+    # 3) Verify using new atomic tool
+    verify_result = await verify_installation(qualified_name)
+    verified = verify_result.get("verified", False)
+    
     return {
         "status": "success",
+        "deprecation_warning": deprecation_msg,
         "discovered": {
-            "name": selected["name"],
+            "name": top_result["display_name"],
             "qualifiedName": qualified_name,
-            "install_command": install_command
+            "install_command": top_result["install_command"]
         },
-        "installation": install_status,
+        "installation": {
+            "status": install_result["status"],
+            "message": install_result["message"]
+        },
         "verification": {
             "verified": verified,
-            "config_path": verification.get("config_path"),
-            "installed_count": verification.get("total") if verification.get("status") == "success" else None
+            "config_path": verify_result.get("config_path")
         }
     }
 
 @mcp.tool
 async def discover_mcps(analysis: Any) -> Dict[str, Any]:
     """
-    Takes codebase analysis from Claude Code and recommends relevant MCPs.
+    DEPRECATED: Use search_registry instead for direct semantic search.
+    This tool will be removed in v2.0.
     
-    Args:
-        analysis: Codebase analysis results including languages, frameworks, and suggestions.
-                  Accepts either an object (preferred) or a JSON string. If a string is
-                  provided, the server will attempt to parse it as JSON.
-    
-    Returns:
-        Dictionary with recommended MCPs ranked by relevance
+    Simple discovery using new atomic search.
     """
-    api_key = os.getenv('SMITHERY_API_KEY')
-    if not api_key:
-        return {
-            "error": "SMITHERY_API_KEY environment variable not set. If running via Claude Code, add it under env in claude_config.json and fully restart the app."
-        }
+    deprecation_msg = "⚠️  DEPRECATED: discover_mcps is deprecated. Use search_registry for direct semantic search."
     
-    # Normalize input to CodebaseAnalysis
+    # Simple fallback - just search for generic terms
     try:
-        if isinstance(analysis, CodebaseAnalysis):
-            analysis_model = analysis
-        elif isinstance(analysis, dict):
-            analysis_model = CodebaseAnalysis(**analysis)
+        if isinstance(analysis, dict):
+            # Extract simple search terms from analysis
+            search_terms = []
+            
+            # Try to extract meaningful search terms from the analysis
+            languages = analysis.get("languages", [])
+            frameworks = analysis.get("frameworks", [])
+            suggested_mcps = analysis.get("suggested_mcps", [])
+            
+            # Build basic search terms
+            search_terms.extend(suggested_mcps[:3])  # Use first 3 suggestions
+            search_terms.extend(languages[:2])       # Use first 2 languages
+            search_terms.extend(frameworks[:2])      # Use first 2 frameworks
+            
+            if not search_terms:
+                search_terms = ["development tools"]
+                
         elif isinstance(analysis, str):
             parsed = json.loads(analysis)
-            if not isinstance(parsed, dict):
-                return {"error": "Invalid analysis payload: expected JSON object after parsing string"}
-            analysis_model = CodebaseAnalysis(**parsed)
+            # Recursively call with parsed dict
+            return await discover_mcps(parsed)
         else:
-            return {"error": "Invalid analysis payload: expected object or JSON string"}
-    except Exception as e:
-        return {"error": f"Failed to parse analysis payload: {str(e)}"}
-
-    recommendations = []
-    
-    try:
-        async with SmitheryRegistryClient(api_key) as client:
-            # Search for each suggested MCP
-            for suggestion in analysis_model.suggested_mcps:
-                result = await find_mcp(suggestion)
-                
-                if "error" not in result:
-                    # Calculate relevance based on project characteristics
-                    relevance = calculate_relevance(
-                        result.get("description", ""),
-                        analysis_model.languages,
-                        analysis_model.frameworks,
-                        analysis_model.project_type
-                    )
-                    
-                    recommendations.append(MCPRecommendation(
-                        qualifiedName=result["qualifiedName"],
-                        displayName=result["name"],
-                        description=result["description"],
-                        relevance_score=relevance,
-                        reason=f"Recommended for {analysis_model.project_type} projects using {', '.join(analysis_model.languages[:2])}",
-                        install_command=result["install_command"]
-                    ).dict())
+            search_terms = ["development tools"]
             
-            # Sort by relevance score
-            recommendations.sort(key=lambda x: x["relevance_score"], reverse=True)
-            
-            return {
-                "status": "success",
-                "project_summary": {
-                    "type": analysis_model.project_type,
-                    "languages": analysis_model.languages,
-                    "frameworks": analysis_model.frameworks
-                },
-                "recommendations": recommendations[:10],  # Top 10 recommendations
-                "total_found": len(recommendations)
-            }
-    
+        # Search using our new atomic tool
+        results = []
+        for term in search_terms[:3]:  # Limit to 3 searches
+            search_result = await search_registry(term, limit=3)
+            if search_result.get("status") == "success":
+                for result in search_result.get("results", []):
+                    results.append({
+                        "qualifiedName": result["qualified_name"],
+                        "displayName": result["display_name"],
+                        "description": result["description"],
+                        "relevance_score": 0.5,  # Basic score
+                        "reason": f"Found via search: {term}",
+                        "install_command": result["install_command"]
+                    })
+        
+        # Remove duplicates and limit results
+        seen = set()
+        unique_results = []
+        for result in results:
+            if result["qualifiedName"] not in seen:
+                seen.add(result["qualifiedName"])
+                unique_results.append(result)
+        
+        return {
+            "status": "success",
+            "deprecation_warning": deprecation_msg,
+            "project_summary": {
+                "type": "unknown",
+                "search_terms_used": search_terms[:3]
+            },
+            "recommendations": unique_results[:10],
+            "total_found": len(unique_results)
+        }
+        
     except Exception as e:
         return {
             "status": "error",
-            "error": f"Failed to generate recommendations: {str(e)}"
+            "error": f"Discovery failed: {str(e)}",
+            "deprecation_warning": deprecation_msg
         }
+
 
 def calculate_relevance(description: str, languages: List[str], 
                         frameworks: List[str], project_type: str) -> float:
@@ -503,44 +452,16 @@ def calculate_relevance(description: str, languages: List[str],
     
     return min(score, 1.0)  # Cap at 1.0
 
-async def install_mcp(qualified_names: List[str]) -> Dict[str, Any]:
-    """
-    Install multiple MCPs in batch.
-    
-    Args:
-        qualified_names: List of MCP qualified names to install
-    
-    Returns:
-        Dictionary with installation results for each MCP
-    """
-    results = []
-    
-    for name in qualified_names:
-        # Find the MCP first to get install command
-        find_result = await find_mcp(name)
-        
-        if "error" in find_result:
-            results.append({
-                "qualifiedName": name,
-                "status": "error",
-                "message": find_result["error"]
-            })
-            continue
-        
-        # Install it
-        install_result = await find_and_install_mcp(name)
-        results.append({
-            "qualifiedName": name,
-            "status": install_result.get("status"),
-            "message": install_result.get("message", "")
-        })
-    
-    return {
-        "status": "complete",
-        "installed": sum(1 for r in results if r["status"] == "success"),
-        "failed": sum(1 for r in results if r["status"] == "error"),
-        "results": results
-    }
+
+
+
+
+
+
+
+
+
+
 
 async def check_mcp() -> Dict[str, Any]:
     """
@@ -586,53 +507,355 @@ async def check_mcp() -> Dict[str, Any]:
             "config_path": str(config_path)
         }
 
-async def update_claude_config(mcps_to_add: List[Dict[str, Any]]) -> Dict[str, Any]:
+
+# New Atomic Tools - Simple, Explicit MCP Operations
+
+@mcp.tool
+async def search_registry(
+    query: str, 
+    limit: int = 10,
+    filters: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
-    Update Claude Code configuration with new MCPs.
+    Pure semantic search of Smithery Registry.
     
     Args:
-        mcps_to_add: List of MCP configurations to add
-                    Each should have: name, command, args
+        query: Exact search term (no interpretation)
+        limit: Maximum results to return
+        filters: Optional Smithery API filters (is_deployed, is_verified, etc.)
     
     Returns:
-        Dictionary with update status
+        Raw search results from Smithery
     """
-    config_path = Path.home() / ".config" / "claude" / "claude_config.json"
-    
-    try:
-        # Read existing config
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-        else:
-            config = {"mcpServers": {}}
-        
-        # Add new MCPs
-        for mcp in mcps_to_add:
-            name = mcp.get("name")
-            if name and name not in config.get("mcpServers", {}):
-                config.setdefault("mcpServers", {})[name] = {
-                    "command": mcp.get("command", "npx"),
-                    "args": mcp.get("args", ["-y", name])
-                }
-        
-        # Write updated config
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
-        
+    api_key = os.getenv('SMITHERY_API_KEY')
+    if not api_key:
         return {
-            "status": "success",
-            "message": f"Added {len(mcps_to_add)} MCPs to configuration",
-            "config_path": str(config_path),
-            "added_mcps": [mcp.get("name") for mcp in mcps_to_add]
+            "status": "error",
+            "error_code": "MISSING_API_KEY",
+            "message": "SMITHERY_API_KEY environment variable not set"
         }
     
+    try:
+        async with SmitheryRegistryClient(api_key) as client:
+            # Build search parameters
+            params = {"page": 1, "pageSize": limit}
+            if query.strip():
+                params["query"] = query.strip()
+            
+            # Add filters if provided
+            if filters:
+                # Convert common filter patterns
+                if filters.get("is_deployed"):
+                    query = f"{query} is:deployed" if query.strip() else "is:deployed"
+                if filters.get("is_verified"):
+                    query = f"{query} is:verified" if query.strip() else "is:verified"
+                if filters.get("owner"):
+                    query = f"{query} owner:{filters['owner']}" if query.strip() else f"owner:{filters['owner']}"
+            
+            # Search the registry
+            server_list = await client.list_servers(query=query, page=1, pageSize=limit)
+            
+            # Format results
+            results = []
+            for server in server_list.servers:
+                results.append({
+                    "qualified_name": server.qualifiedName,
+                    "display_name": server.displayName,
+                    "description": server.description,
+                    "homepage": server.homepage,
+                    "use_count": server.useCount,
+                    "is_deployed": server.isDeployed,
+                    "created_at": server.createdAt,
+                    "install_command": f"npx -y {server.qualifiedName}"
+                })
+            
+            return {
+                "status": "success",
+                "query": query,
+                "total_results": len(results),
+                "results": results
+            }
+            
+    except Exception as e:
+        return {
+            "status": "error", 
+            "error_code": "SEARCH_FAILED",
+            "message": f"Search failed: {str(e)}"
+        }
+
+@mcp.tool
+async def get_mcp_info(qualified_name: str) -> Dict[str, Any]:
+    """
+    Get detailed information about a specific MCP.
+    
+    Args:
+        qualified_name: Exact MCP identifier
+    
+    Returns:
+        Complete MCP details from Smithery
+    """
+    api_key = os.getenv('SMITHERY_API_KEY')
+    if not api_key:
+        return {
+            "status": "error",
+            "error_code": "MISSING_API_KEY", 
+            "message": "SMITHERY_API_KEY environment variable not set"
+        }
+    
+    try:
+        async with SmitheryRegistryClient(api_key) as client:
+            server_details = await client.get_server(qualified_name)
+            
+            return {
+                "status": "success",
+                "mcp_info": {
+                    "qualified_name": server_details.qualifiedName,
+                    "display_name": server_details.displayName,
+                    "deployment_url": server_details.deploymentUrl,
+                    "connections": server_details.connections,
+                    "install_command": f"npx -y {server_details.qualifiedName}"
+                }
+            }
+            
     except Exception as e:
         return {
             "status": "error",
-            "message": f"Failed to update configuration: {str(e)}",
-            "config_path": str(config_path)
+            "error_code": "INFO_FAILED",
+            "message": f"Failed to get MCP info: {str(e)}"
+        }
+
+@mcp.tool
+async def install_mcp(
+    qualified_name: str,
+    install_command: Optional[str] = None,
+    timeout_seconds: int = 60
+) -> Dict[str, Any]:
+    """
+    Install a single MCP.
+    
+    Args:
+        qualified_name: MCP to install
+        install_command: Optional override for install command
+        timeout_seconds: Installation timeout
+    
+    Returns:
+        Installation status and output
+    """
+    if not qualified_name or not qualified_name.strip():
+        return {
+            "status": "error",
+            "error_code": "INVALID_INPUT",
+            "message": "qualified_name is required"
+        }
+    
+    # Use provided install command or generate default
+    cmd = install_command or f"npx -y {qualified_name}"
+    full_command = f"claude mcp add {qualified_name} -- {cmd}"
+    
+    try:
+        # Execute installation
+        result = subprocess.run(
+            ["claude", "mcp", "add", qualified_name, "--"] + cmd.split(),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds
+        )
+        
+        return {
+            "status": "success", 
+            "message": f"Successfully installed {qualified_name}",
+            "qualified_name": qualified_name,
+            "install_command": full_command,
+            "output": result.stdout
+        }
+        
+    except subprocess.CalledProcessError as e:
+        return {
+            "status": "error",
+            "error_code": "INSTALL_FAILED",
+            "message": f"Installation failed for {qualified_name}",
+            "qualified_name": qualified_name,
+            "install_command": full_command,
+            "error_output": e.stderr
+        }
+        
+    except subprocess.TimeoutExpired:
+        return {
+            "status": "error",
+            "error_code": "INSTALL_TIMEOUT",
+            "message": f"Installation timed out for {qualified_name}",
+            "qualified_name": qualified_name,
+            "timeout_seconds": timeout_seconds
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_code": "INSTALL_ERROR", 
+            "message": f"Unexpected error: {str(e)}",
+            "qualified_name": qualified_name
+        }
+
+@mcp.tool
+async def verify_installation(qualified_name: str) -> Dict[str, Any]:
+    """
+    Check if an MCP is properly installed.
+    
+    Args:
+        qualified_name: MCP to verify
+    
+    Returns:
+        Verification status
+    """
+    if not qualified_name or not qualified_name.strip():
+        return {
+            "status": "error",
+            "error_code": "INVALID_INPUT",
+            "message": "qualified_name is required"
+        }
+    
+    try:
+        # Check Claude configuration
+        config_check = await check_mcp()
+        
+        if config_check.get("status") != "success":
+            return {
+                "status": "error",
+                "error_code": "CONFIG_CHECK_FAILED",
+                "message": "Could not read Claude configuration",
+                "verified": False
+            }
+        
+        # Look for the MCP in installed list
+        found = False
+        for mcp_entry in config_check.get("installed_mcps", []):
+            entry_name = mcp_entry.get("name", "")
+            entry_args = " ".join(mcp_entry.get("args", []))
+            
+            if entry_name == qualified_name or qualified_name in entry_args:
+                found = True
+                break
+        
+        return {
+            "status": "success",
+            "verified": found,
+            "qualified_name": qualified_name,
+            "config_path": config_check.get("config_path")
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_code": "VERIFICATION_ERROR",
+            "message": f"Verification failed: {str(e)}",
+            "verified": False
+        }
+
+@mcp.tool
+async def list_installed() -> Dict[str, Any]:
+    """
+    List all installed MCPs from Claude config.
+    
+    Returns:
+        List of installed MCPs with their configurations
+    """
+    try:
+        result = await check_mcp()
+        
+        if result.get("status") == "success":
+            return {
+                "status": "success",
+                "installed_mcps": result.get("installed_mcps", []),
+                "total_count": result.get("total", 0),
+                "config_path": result.get("config_path")
+            }
+        else:
+            return {
+                "status": "error",
+                "error_code": "CONFIG_READ_FAILED",
+                "message": result.get("message", "Failed to read configuration")
+            }
+            
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_code": "LIST_ERROR",
+            "message": f"Failed to list installed MCPs: {str(e)}"
+        }
+
+@mcp.tool  
+async def uninstall_mcp(qualified_name: str) -> Dict[str, Any]:
+    """
+    Remove an MCP from Claude configuration.
+    
+    Args:
+        qualified_name: MCP to remove
+    
+    Returns:
+        Removal status
+    """
+    if not qualified_name or not qualified_name.strip():
+        return {
+            "status": "error",
+            "error_code": "INVALID_INPUT", 
+            "message": "qualified_name is required"
+        }
+    
+    config_path = Path.home() / ".config" / "claude" / "claude_config.json"
+    
+    try:
+        if not config_path.exists():
+            return {
+                "status": "error",
+                "error_code": "CONFIG_NOT_FOUND",
+                "message": "Claude configuration file not found"
+            }
+        
+        # Read current config
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        mcps = config.get("mcpServers", {})
+        removed = False
+        
+        # Look for MCP to remove (by name or in args)
+        to_remove = []
+        for name, details in mcps.items():
+            args = details.get("args", [])
+            args_str = " ".join(args)
+            
+            if name == qualified_name or qualified_name in args_str:
+                to_remove.append(name)
+                removed = True
+        
+        # Remove found MCPs
+        for name in to_remove:
+            del mcps[name]
+        
+        if removed:
+            # Write updated config
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            return {
+                "status": "success",
+                "message": f"Removed {qualified_name} from configuration",
+                "qualified_name": qualified_name,
+                "removed_entries": to_remove
+            }
+        else:
+            return {
+                "status": "error",
+                "error_code": "NOT_FOUND",
+                "message": f"MCP {qualified_name} not found in configuration"
+            }
+            
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_code": "UNINSTALL_ERROR",
+            "message": f"Failed to uninstall {qualified_name}: {str(e)}"
         }
 
 if __name__ == "__main__":
