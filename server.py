@@ -539,7 +539,7 @@ def suggest_alternatives_for_excluded_query(query: str) -> List[str]:
 async def search_registry(
     query: str, 
     limit: int = 10,
-    filters: Optional[Any] = None
+    filters: Optional[Union[str, Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
     Perform a semantic search of the Smithery Registry with intelligent filtering.
