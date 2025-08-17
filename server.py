@@ -14,10 +14,13 @@ Version: 2.0
 """
 
 import base64
+import html
 import json
+import logging
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Union
 
@@ -25,13 +28,153 @@ import aiohttp
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("scoutmcp")
+
 # Initialize the FastMCP server
 mcp = FastMCP("MCP Scout")
 
-# Constants
-REGISTRY_API_BASE = "https://registry.smithery.ai"
-DEFAULT_TIMEOUT_SECONDS = 180
-DEFAULT_PAGE_SIZE = 10
+
+@dataclass
+class ScoutMCPConfig:
+    """Centralized configuration with validation."""
+    registry_api_base: str = "https://registry.smithery.ai"
+    default_timeout: int = 300
+    max_timeout: int = 600
+    default_page_size: int = 10
+    max_page_size: int = 50
+    max_retries: int = 2
+    
+    def __post_init__(self):
+        """Validate configuration values."""
+        if self.default_timeout <= 0 or self.default_timeout > self.max_timeout:
+            raise ValueError(f"Invalid timeout configuration: {self.default_timeout}")
+        if self.default_page_size <= 0 or self.default_page_size > self.max_page_size:
+            raise ValueError(f"Invalid page size configuration: {self.default_page_size}")
+        if self.max_retries <= 0:
+            raise ValueError(f"Invalid retry configuration: {self.max_retries}")
+
+
+# Global configuration instance
+config = ScoutMCPConfig()
+
+# Legacy constants for backward compatibility
+REGISTRY_API_BASE = config.registry_api_base
+DEFAULT_TIMEOUT_SECONDS = config.default_timeout
+DEFAULT_PAGE_SIZE = config.default_page_size
+
+
+class ScoutMCPError(Exception):
+    """Base exception for ScoutMCP operations."""
+    pass
+
+
+class SecurityError(ScoutMCPError):
+    """Raised when security validation fails."""
+    pass
+
+
+class ValidationError(ScoutMCPError):
+    """Raised when input validation fails."""
+    pass
+
+
+def validate_qualified_name(name: str) -> str:
+    """Validate and sanitize MCP qualified names.
+    
+    Args:
+        name: The qualified name to validate
+        
+    Returns:
+        Sanitized qualified name
+        
+    Raises:
+        ValidationError: If the name is invalid
+    """
+    if not name or not isinstance(name, str):
+        raise ValidationError("Qualified name must be a non-empty string")
+    
+    # Remove dangerous characters and normalize
+    sanitized = re.sub(r'[;&|`$<>"\']', '', name.strip())
+    
+    # Validate format (should be like owner/name or @scope/name)
+    if not re.match(r'^[@\w.-]+[/\w.-]*[\w.-]$', sanitized):
+        raise ValidationError(f"Invalid qualified name format: {name}")
+    
+    if len(sanitized) > 100:  # Reasonable length limit
+        raise ValidationError("Qualified name too long")
+    
+    logger.debug(f"Validated qualified name: {name} -> {sanitized}")
+    return sanitized
+
+
+def validate_client_name(client: str) -> str:
+    """Validate client name parameter.
+    
+    Args:
+        client: The client name to validate
+        
+    Returns:
+        Validated client name
+        
+    Raises:
+        ValidationError: If the client name is invalid
+    """
+    if not client or not isinstance(client, str):
+        raise ValidationError("Client name must be a non-empty string")
+    
+    # Only allow alphanumeric characters, hyphens, and underscores
+    sanitized = re.sub(r'[^a-zA-Z0-9_-]', '', client.strip())
+    
+    if not sanitized or len(sanitized) > 50:
+        raise ValidationError(f"Invalid client name: {client}")
+    
+    return sanitized
+
+
+def secure_subprocess_run(cmd: List[str], **kwargs) -> subprocess.CompletedProcess:
+    """Secure subprocess execution with validation.
+    
+    Args:
+        cmd: Command and arguments as list of strings
+        **kwargs: Additional arguments for subprocess.run
+        
+    Returns:
+        CompletedProcess result
+        
+    Raises:
+        SecurityError: If command validation fails
+    """
+    if not cmd or not isinstance(cmd, list) or not all(isinstance(arg, str) for arg in cmd):
+        raise SecurityError("Command must be a non-empty list of strings")
+    
+    # Validate command components for dangerous characters
+    dangerous_chars = [';', '&', '|', '`', '$', '>', '<', '"', "'"]
+    for i, arg in enumerate(cmd):
+        if any(char in arg for char in dangerous_chars):
+            # Allow some safe characters in specific contexts
+            if i == 0 and arg in ['npx', 'node', 'python', 'python3']:
+                continue
+            if '--' in arg or arg.startswith('@') or arg.startswith('./'):
+                continue
+            logger.warning(f"Potentially dangerous characters in command argument: {arg}")
+    
+    # Force specific security settings
+    secure_kwargs = {
+        'shell': False,  # Never use shell
+        'check': kwargs.get('check', False),
+        'capture_output': kwargs.get('capture_output', True),
+        'text': kwargs.get('text', True),
+        'timeout': min(kwargs.get('timeout', config.default_timeout), config.max_timeout),
+        'input': kwargs.get('input')
+    }
+    
+    logger.info(f"Executing secure subprocess: {' '.join(cmd[:2])}...")
+    return subprocess.run(cmd, **secure_kwargs)
 
 
 class ServerListItem(BaseModel):
@@ -378,15 +521,33 @@ async def get_installed_mcps() -> Dict[str, Any]:
             "checked_paths": [str(local_config_path), str(home_config_path), str(global_config_path)]
         }
     
-    # Build installed MCPs list
+    # Build installed MCPs list with hot-reload detection
     installed = []
     for name, details in all_mcps.items():
-        installed.append({
+        command = details.get("command", "")
+        args = details.get("args", [])
+        env = details.get("env", {})
+        
+        # Check if this MCP has hot-reload enabled
+        hot_reload_enabled = _is_hot_reload_wrapped(command, args)
+        
+        mcp_entry = {
             "name": name,
-            "command": details.get("command", ""),
-            "args": details.get("args", []),
-            "env": details.get("env", {})
-        })
+            "command": command,
+            "args": args,
+            "env": env,
+            "hot_reload_enabled": hot_reload_enabled
+        }
+        
+        # If hot-reload is enabled, also include the original command info
+        if hot_reload_enabled:
+            unwrapped = _unwrap_hot_reload(command, args)
+            mcp_entry.update({
+                "original_command": unwrapped["command"],
+                "original_args": unwrapped["args"]
+            })
+        
+        installed.append(mcp_entry)
     
     return {
         "status": "success",
@@ -902,25 +1063,250 @@ def _detect_api_requirements(qualified_name: str) -> Dict[str, Any]:
     return {"requires_api_key": False}
 
 
+def _check_mcp_reloader_availability() -> Dict[str, Any]:
+    """
+    Check if mcp-reloader is available via local build or npx.
+    
+    Returns:
+        Dictionary containing availability status and installation instructions
+    """
+    # First check local build in the ScoutMCP project
+    local_reloader_path = Path(__file__).parent / "mcp-reloader" / "dist" / "cli.js"
+    if local_reloader_path.exists():
+        return {
+            "available": True,
+            "source": "local",
+            "path": str(local_reloader_path),
+            "message": "mcp-reloader is available via local build"
+        }
+    
+    try:
+        # Check if npx is available
+        npx_result = secure_subprocess_run(
+            ["npx", "--version"],
+            timeout=10
+        )
+        
+        if npx_result.returncode != 0:
+            return {
+                "available": False,
+                "error": "npx_not_found",
+                "message": "npx is not available. Please install Node.js and npm.",
+                "install_instructions": "Visit https://nodejs.org to install Node.js and npm"
+            }
+        
+        # Check if mcp-reloader is available via npx
+        reloader_result = secure_subprocess_run(
+            ["npx", "mcp-reloader", "--help"],
+            timeout=30
+        )
+        
+        return {
+            "available": True,
+            "source": "npx",
+            "npx_version": npx_result.stdout.strip(),
+            "message": "mcp-reloader is available via npx"
+        }
+        
+    except subprocess.TimeoutExpired:
+        return {
+            "available": False,
+            "error": "timeout",
+            "message": "Timeout checking mcp-reloader availability"
+        }
+    except Exception as e:
+        return {
+            "available": False,
+            "error": "check_failed",
+            "message": f"Failed to check mcp-reloader availability: {str(e)}"
+        }
+
+
+class HotReloadManager:
+    """Centralized hot-reload management with comprehensive functionality."""
+    
+    @staticmethod
+    def check_availability() -> Dict[str, Any]:
+        """Check if mcp-reloader is available via local build or npx."""
+        return _check_mcp_reloader_availability()
+    
+    @staticmethod
+    def is_wrapped(command: str, args: List[str]) -> bool:
+        """Check if command is wrapped with hot-reload."""
+        return _is_hot_reload_wrapped(command, args)
+    
+    @staticmethod
+    def wrap_command(command: str, args: List[str], include_patterns: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Wrap command with hot-reload capabilities."""
+        return _wrap_with_hot_reload(command, args, include_patterns)
+    
+    @staticmethod
+    def unwrap_command(command: str, args: List[str]) -> Dict[str, Any]:
+        """Remove hot-reload wrapper from command."""
+        return _unwrap_hot_reload(command, args)
+    
+    @staticmethod
+    def should_enable_by_default(qualified_name: str) -> bool:
+        """Determine if hot-reload should be enabled by default for this MCP."""
+        return _should_enable_hot_reload_by_default(qualified_name)
+    
+    @classmethod
+    def get_status_summary(cls) -> Dict[str, Any]:
+        """Get comprehensive hot-reload status summary."""
+        availability = cls.check_availability()
+        return {
+            "hot_reload_available": availability["available"],
+            "reloader_source": availability.get("source", "unavailable"),
+            "manager_class": "HotReloadManager",
+            "capabilities": [
+                "Command wrapping/unwrapping",
+                "Availability checking", 
+                "Auto-detection logic",
+                "Status reporting"
+            ]
+        }
+
+
+def _is_hot_reload_wrapped(command: str, args: List[str]) -> bool:
+    """
+    Check if an MCP configuration is already wrapped with mcp-reloader.
+    
+    Args:
+        command: The command string
+        args: List of command arguments
+        
+    Returns:
+        True if the MCP is wrapped with hot-reload, False otherwise
+    """
+    # Check if mcp-reloader is in the command or args
+    if "mcp-reloader" in command:
+        return True
+    
+    # Check if mcp-reloader appears in the args list
+    for arg in args:
+        if "mcp-reloader" in arg:
+            return True
+    
+    return False
+
+
+def _wrap_with_hot_reload(command: str, args: List[str], include_patterns: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    Wrap an MCP command with mcp-reloader for hot-reload capability.
+    
+    Args:
+        command: Original command string
+        args: Original command arguments
+        include_patterns: Optional list of file patterns to watch for full restart
+        
+    Returns:
+        Dictionary with new command and args for hot-reload wrapper
+    """
+    # Check availability and determine the appropriate command
+    reloader_check = _check_mcp_reloader_availability()
+    if not reloader_check["available"]:
+        raise RuntimeError(f"mcp-reloader not available: {reloader_check['message']}")
+    
+    if reloader_check.get("source") == "local":
+        # Use local build
+        wrapper_command = "node"
+        new_args = [reloader_check["path"]]
+    else:
+        # Use npx
+        wrapper_command = "npx"
+        new_args = ["mcp-reloader"]
+    
+    # Add include patterns if provided
+    if include_patterns:
+        for pattern in include_patterns:
+            new_args.extend(["--include", pattern])
+    
+    # Add separator and original command
+    new_args.append("--")
+    new_args.append(command)
+    new_args.extend(args)
+    
+    return {
+        "command": wrapper_command,
+        "args": new_args
+    }
+
+
+def _unwrap_hot_reload(command: str, args: List[str]) -> Dict[str, Any]:
+    """
+    Remove mcp-reloader wrapper from an MCP configuration.
+    
+    Args:
+        command: Current command string (likely "npx" or "node")
+        args: Current command arguments (containing mcp-reloader)
+        
+    Returns:
+        Dictionary with original command and args without hot-reload wrapper
+    """
+    if not _is_hot_reload_wrapped(command, args):
+        return {"command": command, "args": args}
+    
+    # Find the "--" separator to extract original command
+    try:
+        separator_index = args.index("--")
+        if separator_index + 1 < len(args):
+            original_command = args[separator_index + 1]
+            original_args = args[separator_index + 2:]
+            return {
+                "command": original_command,
+                "args": original_args
+            }
+    except ValueError:
+        pass
+    
+    # Fallback: return as-is if we can't parse
+    return {"command": command, "args": args}
+
+
+def _should_enable_hot_reload_by_default(qualified_name: str) -> bool:
+    """
+    Determine if hot-reload should be enabled by default for an MCP.
+    
+    Args:
+        qualified_name: The MCP qualified name
+        
+    Returns:
+        True if hot-reload should be enabled by default, False otherwise
+    """
+    # Enable for development-looking MCPs
+    dev_indicators = [
+        "dev", "development", "local", "test", "example", "demo",
+        "@local/", "file://", "./", "../"
+    ]
+    
+    name_lower = qualified_name.lower()
+    return any(indicator in name_lower for indicator in dev_indicators)
+
+
 @mcp.tool
 async def install_mcp(
     qualified_name: str,
     client: str = "claude",
     config: Optional[Dict[str, Any]] = None,
+    enable_hot_reload: Optional[bool] = None,
+    include_patterns: Optional[List[str]] = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
 ) -> Dict[str, Any]:
     """
-    Install a single MCP server using the official Smithery CLI.
+    Install a single MCP server using the official Smithery CLI with optional hot-reload.
     
     This tool executes the installation command to add an MCP server to the
     specified client configuration, handling timeouts and providing detailed error reporting.
-    Uses the official Smithery CLI for proper installation.
+    Uses the official Smithery CLI for proper installation, and optionally wraps the
+    installed MCP with mcp-reloader for hot-reload capabilities.
     
     Args:
         qualified_name: The unique identifier of the MCP to install (e.g., @redis/mcp-redis)
         client: Target client for installation (claude, cursor, windsurf, etc.) (default: claude)
         config: Optional configuration object to pass to the MCP
-        timeout_seconds: Maximum time to wait for installation (default: 60)
+        enable_hot_reload: Enable hot-reload wrapper (None=auto-detect, True=force enable, False=disable)
+        include_patterns: File patterns to watch for full restart (only used if hot-reload enabled)
+        timeout_seconds: Maximum time to wait for installation (default: 180)
     
     Returns:
         Dictionary containing:
@@ -933,19 +1319,30 @@ async def install_mcp(
         - error_output: Error details (if failed)
         - error_code: Specific error code (if error)
         - api_requirements: Information about required API keys
+        - hot_reload_enabled: Whether hot-reload was enabled for this MCP
+        - hot_reload_info: Information about hot-reload configuration (if enabled)
     """
-    if not qualified_name or not qualified_name.strip():
+    logger.info(f"Starting MCP installation: {qualified_name} for {client}")
+    
+    try:
+        # Validate inputs using security framework
+        validated_name = validate_qualified_name(qualified_name)
+        validated_client = validate_client_name(client)
+        logger.debug(f"Input validation passed: {validated_name} -> {validated_client}")
+    except (ValidationError, SecurityError) as e:
+        logger.error(f"Input validation failed for {qualified_name}: {e}")
         return {
             "status": "error",
             "error_code": "INVALID_INPUT",
-            "message": "qualified_name parameter is required and cannot be empty"
+            "message": str(e)
         }
     
     # Detect API key requirements
-    api_requirements = _detect_api_requirements(qualified_name)
+    api_requirements = _detect_api_requirements(validated_name)
+    logger.debug(f"API requirements for {validated_name}: {api_requirements}")
     
     # Build official Smithery CLI command
-    cmd_parts = ["npx", "-y", "@smithery/cli@latest", "install", qualified_name.strip(), "--client", client]
+    cmd_parts = ["npx", "-y", "@smithery/cli@latest", "install", validated_name, "--client", validated_client]
     
     # Add config if provided
     if config:
@@ -954,26 +1351,107 @@ async def install_mcp(
         cmd_parts.extend(["--config", config_json])
     
     full_command = " ".join(cmd_parts)
+    logger.info(f"Installation command: {full_command}")
     
     # Retry logic for transient failures
-    max_retries = 2
+    max_retries = config.max_retries
     last_error = None
     
     for attempt in range(max_retries):
+        logger.debug(f"Installation attempt {attempt + 1}/{max_retries}")
         try:
             # Execute installation using secure subprocess with official Smithery CLI
             # Provide automatic "yes" response to any prompts
-            result = subprocess.run(
+            result = secure_subprocess_run(
                 cmd_parts,
                 check=True,
-                capture_output=True,
-                text=True,
                 timeout=timeout_seconds,
                 input="y\n"
             )
             
-            # Build success message with API key guidance if needed
-            success_message = f"Successfully installed {qualified_name} for {client} client. Restart your terminal to use the new MCP."
+            # Determine if hot-reload should be enabled
+            should_enable_hot_reload = enable_hot_reload
+            if should_enable_hot_reload is None:
+                should_enable_hot_reload = _should_enable_hot_reload_by_default(qualified_name)
+            
+            hot_reload_info = {"enabled": False}
+            
+            # Apply hot-reload if requested and available
+            if should_enable_hot_reload:
+                reloader_check = _check_mcp_reloader_availability()
+                if reloader_check["available"]:
+                    try:
+                        # Read the current configuration to modify it
+                        if client == "claude":
+                            config_path = Path.home() / ".config" / "claude" / "claude_config.json"
+                            if config_path.exists():
+                                with open(config_path, 'r', encoding='utf-8') as f:
+                                    config_data = json.load(f)
+                                
+                                # Find the installed MCP and wrap it with hot-reload
+                                sanitized_name = _sanitize_mcp_name(qualified_name)
+                                mcp_servers = config_data.get("mcpServers", {})
+                                
+                                # Look for the MCP by qualified name or sanitized name
+                                mcp_key = None
+                                for key in mcp_servers.keys():
+                                    if key == qualified_name.strip() or key == sanitized_name:
+                                        mcp_key = key
+                                        break
+                                
+                                if mcp_key and not _is_hot_reload_wrapped(
+                                    mcp_servers[mcp_key].get("command", ""),
+                                    mcp_servers[mcp_key].get("args", [])
+                                ):
+                                    # Wrap the MCP with hot-reload
+                                    original_command = mcp_servers[mcp_key].get("command", "")
+                                    original_args = mcp_servers[mcp_key].get("args", [])
+                                    
+                                    wrapped = _wrap_with_hot_reload(
+                                        original_command, 
+                                        original_args, 
+                                        include_patterns
+                                    )
+                                    
+                                    # Update the configuration
+                                    mcp_servers[mcp_key]["command"] = wrapped["command"]
+                                    mcp_servers[mcp_key]["args"] = wrapped["args"]
+                                    
+                                    # Write back the configuration
+                                    with open(config_path, 'w', encoding='utf-8') as f:
+                                        json.dump(config_data, f, indent=2)
+                                    
+                                    hot_reload_info = {
+                                        "enabled": True,
+                                        "mcp_key": mcp_key,
+                                        "include_patterns": include_patterns or [],
+                                        "wrapped_command": wrapped["command"],
+                                        "wrapped_args": wrapped["args"]
+                                    }
+                        
+                    except Exception as e:
+                        # Hot-reload setup failed, but installation succeeded
+                        hot_reload_info = {
+                            "enabled": False,
+                            "error": f"Failed to enable hot-reload: {str(e)}"
+                        }
+                else:
+                    hot_reload_info = {
+                        "enabled": False,
+                        "error": reloader_check["message"],
+                        "install_instructions": reloader_check.get("install_instructions")
+                    }
+            
+            # Build success message with API key and hot-reload guidance
+            success_message = f"Successfully installed {qualified_name} for {client} client."
+            
+            if hot_reload_info["enabled"]:
+                success_message += " Hot-reload is enabled - changes will be reflected automatically."
+            else:
+                success_message += " Restart your terminal to use the new MCP."
+                if "error" in hot_reload_info:
+                    success_message += f"\n\nNote: Hot-reload setup failed: {hot_reload_info['error']}"
+            
             if api_requirements.get("requires_api_key"):
                 success_message += f"\n\nIMPORTANT: This MCP requires API configuration:\n{api_requirements['instructions']}"
             
@@ -984,7 +1462,9 @@ async def install_mcp(
                 "client": client,
                 "install_command": full_command,
                 "output": result.stdout,
-                "api_requirements": api_requirements
+                "api_requirements": api_requirements,
+                "hot_reload_enabled": hot_reload_info["enabled"],
+                "hot_reload_info": hot_reload_info
             }
             
         except subprocess.CalledProcessError as e:
@@ -1011,13 +1491,33 @@ async def install_mcp(
             return {
                 "status": "error",
                 "error_code": "INSTALL_TIMEOUT",
-                "message": f"Installation timed out after {timeout_seconds}s (tried {max_retries} times). Try running manually: {full_command}",
+                "message": (
+                    f"Installation timed out after {timeout_seconds}s (tried {max_retries} times).\n\n"
+                    f"💡 RECOMMENDED SOLUTIONS:\n\n"
+                    f"1. Manual Installation (Most Reliable):\n"
+                    f"   Run this command directly in your terminal:\n"
+                    f"   {full_command}\n\n"
+                    f"2. Use install_mcp_manual tool:\n"
+                    f"   Call install_mcp_manual('{qualified_name}') for step-by-step instructions\n\n"
+                    f"3. Increase timeout:\n"
+                    f"   Try install_mcp('{qualified_name}', timeout_seconds=600) for slower connections\n\n"
+                    f"4. After manual installation:\n"
+                    f"   Use enable_hot_reload('{qualified_name}') if you want hot-reload capabilities\n\n"
+                    f"ℹ️  Manual installation provides real-time feedback and no timeout constraints."
+                ),
                 "qualified_name": qualified_name.strip(),
                 "client": client,
                 "timeout_seconds": timeout_seconds,
                 "install_command": full_command,
+                "manual_alternative": f"install_mcp_manual('{qualified_name}')",
                 "api_requirements": api_requirements,
-                "retry_attempts": max_retries
+                "retry_attempts": max_retries,
+                "troubleshooting_tips": [
+                    "Check your internet connection speed",
+                    "Try during off-peak hours for better Smithery API response",
+                    "Use manual installation for unreliable connections",
+                    "Consider increasing timeout_seconds parameter"
+                ]
             }
             
         except Exception as e:
@@ -1039,13 +1539,540 @@ async def install_mcp(
 
 
 @mcp.tool
+async def install_mcp_manual(
+    qualified_name: str,
+    client: str = "claude",
+    config: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Generate manual installation command for reliable MCP installation.
+    
+    This tool provides the exact command to run manually when automated installation
+    times out or fails. Use this for slow connections or troubleshooting.
+    After manual installation, use enable_hot_reload if needed.
+    
+    Args:
+        qualified_name: The unique identifier of the MCP to install (e.g., @redis/mcp-redis)
+        client: Target client for installation (claude, cursor, windsurf, etc.) (default: claude)
+        config: Optional configuration object to pass to the MCP
+    
+    Returns:
+        Dictionary containing:
+        - status: "success"
+        - manual_command: Exact command to run manually
+        - post_install_steps: Instructions for after manual installation
+        - api_requirements: Information about required API keys
+        - hot_reload_suggestion: How to enable hot-reload after installation
+    """
+    if not qualified_name or not qualified_name.strip():
+        return {
+            "status": "error",
+            "error_code": "INVALID_INPUT",
+            "message": "qualified_name parameter is required and cannot be empty"
+        }
+    
+    # Detect API key requirements
+    api_requirements = _detect_api_requirements(qualified_name)
+    
+    # Build manual command
+    cmd_parts = ["npx", "-y", "@smithery/cli@latest", "install", qualified_name.strip(), "--client", client]
+    
+    # Add config if provided
+    if config:
+        config_json = json.dumps(config)
+        cmd_parts.extend(["--config", config_json])
+    
+    manual_command = " ".join(cmd_parts)
+    
+    # Post-installation steps
+    post_install_steps = [
+        "1. Run the command above in your terminal",
+        "2. Answer 'y' when prompted to confirm installation",
+        "3. Wait for installation to complete",
+        "4. Restart your Claude session if needed"
+    ]
+    
+    # Add hot-reload suggestion if applicable
+    hot_reload_suggestion = None
+    if _should_enable_hot_reload_by_default(qualified_name):
+        reloader_check = _check_mcp_reloader_availability()
+        if reloader_check["available"]:
+            hot_reload_suggestion = f"After installation, run: enable_hot_reload('{qualified_name}') to enable hot-reload"
+        else:
+            hot_reload_suggestion = f"Hot-reload not available: {reloader_check['message']}"
+    
+    # Build success message
+    message = f"Manual installation command for {qualified_name}:"
+    if api_requirements.get("requires_api_key"):
+        message += f"\n\nIMPORTANT: This MCP requires API configuration:\n{api_requirements['instructions']}"
+    
+    return {
+        "status": "success",
+        "message": message,
+        "qualified_name": qualified_name.strip(),
+        "client": client,
+        "manual_command": manual_command,
+        "post_install_steps": post_install_steps,
+        "api_requirements": api_requirements,
+        "hot_reload_suggestion": hot_reload_suggestion,
+        "timeout_note": "Manual installation has no timeout constraints and provides real-time feedback"
+    }
+
+
+@mcp.tool
+async def enable_hot_reload(
+    qualified_name: str,
+    include_patterns: Optional[List[str]] = None,
+    client: str = "claude"
+) -> Dict[str, Any]:
+    """
+    Enable hot-reload for an existing installed MCP server.
+    
+    This tool wraps an existing MCP installation with mcp-reloader to enable
+    hot-reload capabilities. The MCP must already be installed.
+    
+    Args:
+        qualified_name: The unique identifier of the MCP to enable hot-reload for
+        include_patterns: Optional file patterns to watch for full restart
+        client: Target client to modify (claude, cursor, windsurf, etc.) (default: claude)
+    
+    Returns:
+        Dictionary containing:
+        - status: "success" or "error"
+        - message: Human-readable status message
+        - qualified_name: The MCP qualified name
+        - hot_reload_enabled: Whether hot-reload was successfully enabled
+        - hot_reload_info: Information about the hot-reload configuration
+        - error_code: Specific error code (if error)
+    """
+    if not qualified_name or not qualified_name.strip():
+        return {
+            "status": "error",
+            "error_code": "INVALID_INPUT",
+            "message": "qualified_name parameter is required and cannot be empty"
+        }
+    
+    qualified_name_clean = qualified_name.strip()
+    
+    # Check if mcp-reloader is available
+    reloader_check = _check_mcp_reloader_availability()
+    if not reloader_check["available"]:
+        return {
+            "status": "error",
+            "error_code": "MCP_RELOADER_UNAVAILABLE",
+            "message": reloader_check["message"],
+            "install_instructions": reloader_check.get("install_instructions"),
+            "qualified_name": qualified_name_clean,
+            "hot_reload_enabled": False
+        }
+    
+    try:
+        # Get current MCP installations
+        config_result = await get_installed_mcps()
+        if config_result.get("status") != "success":
+            return {
+                "status": "error",
+                "error_code": "CONFIG_READ_FAILED",
+                "message": "Could not read Claude configuration file",
+                "qualified_name": qualified_name_clean,
+                "hot_reload_enabled": False
+            }
+        
+        # Find the target MCP
+        target_mcp = None
+        sanitized_name = _sanitize_mcp_name(qualified_name_clean)
+        
+        for mcp_entry in config_result.get("installed_mcps", []):
+            entry_name = mcp_entry.get("name", "")
+            entry_args = mcp_entry.get("args", [])
+            
+            if (entry_name == qualified_name_clean or 
+                entry_name == sanitized_name or
+                _is_exact_match_in_args(qualified_name_clean, entry_args) or
+                _is_exact_match_in_args(sanitized_name, entry_args)):
+                target_mcp = mcp_entry
+                break
+        
+        if not target_mcp:
+            return {
+                "status": "error",
+                "error_code": "MCP_NOT_FOUND",
+                "message": f"MCP '{qualified_name_clean}' is not installed. Install it first using install_mcp.",
+                "qualified_name": qualified_name_clean,
+                "hot_reload_enabled": False
+            }
+        
+        # Check if already hot-reload wrapped
+        current_command = target_mcp.get("command", "")
+        current_args = target_mcp.get("args", [])
+        
+        if _is_hot_reload_wrapped(current_command, current_args):
+            return {
+                "status": "success",
+                "message": f"MCP '{qualified_name_clean}' already has hot-reload enabled",
+                "qualified_name": qualified_name_clean,
+                "hot_reload_enabled": True,
+                "hot_reload_info": {
+                    "already_enabled": True,
+                    "current_command": current_command,
+                    "current_args": current_args
+                }
+            }
+        
+        # Modify the Claude configuration to wrap with hot-reload
+        if client == "claude":
+            config_path = Path.home() / ".config" / "claude" / "claude_config.json"
+            if not config_path.exists():
+                return {
+                    "status": "error",
+                    "error_code": "CONFIG_NOT_FOUND",
+                    "message": f"Claude configuration file not found at {config_path}",
+                    "qualified_name": qualified_name_clean,
+                    "hot_reload_enabled": False
+                }
+            
+            # Read and modify configuration
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+            
+            mcp_servers = config_data.get("mcpServers", {})
+            mcp_key = target_mcp.get("name")
+            
+            if mcp_key in mcp_servers:
+                # Wrap the MCP with hot-reload
+                wrapped = _wrap_with_hot_reload(
+                    current_command,
+                    current_args,
+                    include_patterns
+                )
+                
+                # Update the configuration
+                mcp_servers[mcp_key]["command"] = wrapped["command"]
+                mcp_servers[mcp_key]["args"] = wrapped["args"]
+                
+                # Write back the configuration
+                with open(config_path, 'w', encoding='utf-8') as f:
+                    json.dump(config_data, f, indent=2)
+                
+                return {
+                    "status": "success",
+                    "message": f"Successfully enabled hot-reload for '{qualified_name_clean}'. Restart your terminal to activate.",
+                    "qualified_name": qualified_name_clean,
+                    "hot_reload_enabled": True,
+                    "hot_reload_info": {
+                        "mcp_key": mcp_key,
+                        "original_command": current_command,
+                        "original_args": current_args,
+                        "wrapped_command": wrapped["command"],
+                        "wrapped_args": wrapped["args"],
+                        "include_patterns": include_patterns or [],
+                        "config_path": str(config_path)
+                    }
+                }
+            else:
+                return {
+                    "status": "error",
+                    "error_code": "MCP_CONFIG_NOT_FOUND",
+                    "message": f"MCP '{qualified_name_clean}' found in listing but not in config file",
+                    "qualified_name": qualified_name_clean,
+                    "hot_reload_enabled": False
+                }
+        else:
+            return {
+                "status": "error",
+                "error_code": "CLIENT_NOT_SUPPORTED",
+                "message": f"Hot-reload configuration for client '{client}' is not yet supported",
+                "qualified_name": qualified_name_clean,
+                "hot_reload_enabled": False
+            }
+    
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_code": "ENABLE_HOT_RELOAD_ERROR",
+            "message": f"Failed to enable hot-reload for '{qualified_name_clean}': {str(e)}",
+            "qualified_name": qualified_name_clean,
+            "hot_reload_enabled": False
+        }
+
+
+@mcp.tool
+async def disable_hot_reload(
+    qualified_name: str,
+    client: str = "claude"
+) -> Dict[str, Any]:
+    """
+    Disable hot-reload for an existing MCP server by removing the mcp-reloader wrapper.
+    
+    This tool unwraps an MCP that was previously wrapped with mcp-reloader,
+    returning it to its original command configuration.
+    
+    Args:
+        qualified_name: The unique identifier of the MCP to disable hot-reload for
+        client: Target client to modify (claude, cursor, windsurf, etc.) (default: claude)
+    
+    Returns:
+        Dictionary containing:
+        - status: "success" or "error"
+        - message: Human-readable status message
+        - qualified_name: The MCP qualified name
+        - hot_reload_disabled: Whether hot-reload was successfully disabled
+        - original_config: Information about the restored original configuration
+        - error_code: Specific error code (if error)
+    """
+    if not qualified_name or not qualified_name.strip():
+        return {
+            "status": "error",
+            "error_code": "INVALID_INPUT",
+            "message": "qualified_name parameter is required and cannot be empty"
+        }
+    
+    qualified_name_clean = qualified_name.strip()
+    
+    try:
+        # Get current MCP installations
+        config_result = await get_installed_mcps()
+        if config_result.get("status") != "success":
+            return {
+                "status": "error",
+                "error_code": "CONFIG_READ_FAILED",
+                "message": "Could not read Claude configuration file",
+                "qualified_name": qualified_name_clean,
+                "hot_reload_disabled": False
+            }
+        
+        # Find the target MCP
+        target_mcp = None
+        sanitized_name = _sanitize_mcp_name(qualified_name_clean)
+        
+        for mcp_entry in config_result.get("installed_mcps", []):
+            entry_name = mcp_entry.get("name", "")
+            entry_args = mcp_entry.get("args", [])
+            
+            if (entry_name == qualified_name_clean or 
+                entry_name == sanitized_name or
+                _is_exact_match_in_args(qualified_name_clean, entry_args) or
+                _is_exact_match_in_args(sanitized_name, entry_args)):
+                target_mcp = mcp_entry
+                break
+        
+        if not target_mcp:
+            return {
+                "status": "error",
+                "error_code": "MCP_NOT_FOUND",
+                "message": f"MCP '{qualified_name_clean}' is not installed.",
+                "qualified_name": qualified_name_clean,
+                "hot_reload_disabled": False
+            }
+        
+        # Check if hot-reload is currently enabled
+        current_command = target_mcp.get("command", "")
+        current_args = target_mcp.get("args", [])
+        
+        if not _is_hot_reload_wrapped(current_command, current_args):
+            return {
+                "status": "success",
+                "message": f"MCP '{qualified_name_clean}' does not have hot-reload enabled",
+                "qualified_name": qualified_name_clean,
+                "hot_reload_disabled": True,
+                "original_config": {
+                    "already_disabled": True,
+                    "current_command": current_command,
+                    "current_args": current_args
+                }
+            }
+        
+        # Modify the Claude configuration to remove hot-reload wrapper
+        if client == "claude":
+            config_path = Path.home() / ".config" / "claude" / "claude_config.json"
+            if not config_path.exists():
+                return {
+                    "status": "error",
+                    "error_code": "CONFIG_NOT_FOUND",
+                    "message": f"Claude configuration file not found at {config_path}",
+                    "qualified_name": qualified_name_clean,
+                    "hot_reload_disabled": False
+                }
+            
+            # Read and modify configuration
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+            
+            mcp_servers = config_data.get("mcpServers", {})
+            mcp_key = target_mcp.get("name")
+            
+            if mcp_key in mcp_servers:
+                # Unwrap the MCP from hot-reload
+                unwrapped = _unwrap_hot_reload(current_command, current_args)
+                
+                # Update the configuration
+                mcp_servers[mcp_key]["command"] = unwrapped["command"]
+                mcp_servers[mcp_key]["args"] = unwrapped["args"]
+                
+                # Write back the configuration
+                with open(config_path, 'w', encoding='utf-8') as f:
+                    json.dump(config_data, f, indent=2)
+                
+                return {
+                    "status": "success",
+                    "message": f"Successfully disabled hot-reload for '{qualified_name_clean}'. Restart your terminal to apply changes.",
+                    "qualified_name": qualified_name_clean,
+                    "hot_reload_disabled": True,
+                    "original_config": {
+                        "mcp_key": mcp_key,
+                        "wrapped_command": current_command,
+                        "wrapped_args": current_args,
+                        "restored_command": unwrapped["command"],
+                        "restored_args": unwrapped["args"],
+                        "config_path": str(config_path)
+                    }
+                }
+            else:
+                return {
+                    "status": "error",
+                    "error_code": "MCP_CONFIG_NOT_FOUND",
+                    "message": f"MCP '{qualified_name_clean}' found in listing but not in config file",
+                    "qualified_name": qualified_name_clean,
+                    "hot_reload_disabled": False
+                }
+        else:
+            return {
+                "status": "error",
+                "error_code": "CLIENT_NOT_SUPPORTED",
+                "message": f"Hot-reload configuration for client '{client}' is not yet supported",
+                "qualified_name": qualified_name_clean,
+                "hot_reload_disabled": False
+            }
+    
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_code": "DISABLE_HOT_RELOAD_ERROR",
+            "message": f"Failed to disable hot-reload for '{qualified_name_clean}': {str(e)}",
+            "qualified_name": qualified_name_clean,
+            "hot_reload_disabled": False
+        }
+
+
+@mcp.tool
+async def list_hot_reload_status() -> Dict[str, Any]:
+    """
+    List all installed MCPs and their hot-reload status.
+    
+    This tool provides an overview of all installed MCPs and indicates which ones
+    have hot-reload enabled, along with mcp-reloader availability information.
+    
+    Returns:
+        Dictionary containing:
+        - status: "success" or "error"
+        - mcp_reloader_available: Whether mcp-reloader is available via npx
+        - total_mcps: Total number of installed MCPs
+        - hot_reload_enabled_count: Number of MCPs with hot-reload enabled
+        - mcps: List of MCP configurations with hot-reload status
+        - error_code: Specific error code (if error)
+        - message: Human-readable status message
+    """
+    try:
+        # Check mcp-reloader availability
+        reloader_check = _check_mcp_reloader_availability()
+        
+        # Get current MCP installations
+        config_result = await get_installed_mcps()
+        if config_result.get("status") != "success":
+            return {
+                "status": "error",
+                "error_code": "CONFIG_READ_FAILED",
+                "message": "Could not read Claude configuration file",
+                "mcp_reloader_available": reloader_check["available"]
+            }
+        
+        # Analyze each MCP for hot-reload status
+        mcps_with_status = []
+        hot_reload_enabled_count = 0
+        
+        for mcp_entry in config_result.get("installed_mcps", []):
+            mcp_name = mcp_entry.get("name", "")
+            command = mcp_entry.get("command", "")
+            args = mcp_entry.get("args", [])
+            env = mcp_entry.get("env", {})
+            
+            is_hot_reload_enabled = _is_hot_reload_wrapped(command, args)
+            if is_hot_reload_enabled:
+                hot_reload_enabled_count += 1
+            
+            # Extract original command if hot-reload wrapped
+            original_info = {}
+            if is_hot_reload_enabled:
+                unwrapped = _unwrap_hot_reload(command, args)
+                original_info = {
+                    "original_command": unwrapped["command"],
+                    "original_args": unwrapped["args"]
+                }
+                
+                # Extract include patterns if present
+                include_patterns = []
+                try:
+                    # Look for --include patterns in the args
+                    for i, arg in enumerate(args):
+                        if arg == "--include" and i + 1 < len(args):
+                            include_patterns.append(args[i + 1])
+                except:
+                    pass
+                
+                original_info["include_patterns"] = include_patterns
+            
+            mcp_status = {
+                "name": mcp_name,
+                "hot_reload_enabled": is_hot_reload_enabled,
+                "command": command,
+                "args": args,
+                "env": env,
+                **original_info
+            }
+            
+            mcps_with_status.append(mcp_status)
+        
+        total_mcps = len(mcps_with_status)
+        
+        # Build summary message
+        if total_mcps == 0:
+            summary_message = "No MCPs are currently installed"
+        else:
+            summary_message = f"Found {total_mcps} installed MCPs, {hot_reload_enabled_count} with hot-reload enabled"
+            
+            if not reloader_check["available"]:
+                summary_message += f"\n\nNote: mcp-reloader is not available - {reloader_check['message']}"
+                if "install_instructions" in reloader_check:
+                    summary_message += f"\nInstallation: {reloader_check['install_instructions']}"
+        
+        return {
+            "status": "success",
+            "message": summary_message,
+            "mcp_reloader_available": reloader_check["available"],
+            "mcp_reloader_info": reloader_check,
+            "total_mcps": total_mcps,
+            "hot_reload_enabled_count": hot_reload_enabled_count,
+            "mcps": mcps_with_status,
+            "config_sources": config_result.get("config_sources", [])
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_code": "LIST_HOT_RELOAD_STATUS_ERROR",
+            "message": f"Failed to list hot-reload status: {str(e)}"
+        }
+
+
+@mcp.tool
 async def verify_installation(qualified_name: str) -> Dict[str, Any]:
     """
-    Verify that an MCP server is properly installed and configured.
+    Verify that an MCP server is properly installed and configured with hot-reload status.
     
     This tool checks the Claude configuration file to confirm that the specified
     MCP server has been successfully installed and is available for use.
-    Checks both the original qualified name and the sanitized name used by Claude CLI.
+    Checks both the original qualified name and the sanitized name used by Claude CLI,
+    and provides information about hot-reload configuration.
     
     Args:
         qualified_name: The unique identifier of the MCP to verify (e.g., @redis/mcp-redis)
@@ -1057,6 +2084,8 @@ async def verify_installation(qualified_name: str) -> Dict[str, Any]:
         - qualified_name: The original MCP qualified name that was checked
         - sanitized_name: The sanitized name used by Claude CLI
         - found_name: The actual name found in Claude config (if verified)
+        - hot_reload_enabled: Whether hot-reload is enabled for this MCP
+        - hot_reload_info: Hot-reload configuration details (if enabled)
         - config_path: Path to the Claude configuration file
         - error_code: Specific error code (if error)
         - message: Human-readable status message
@@ -1086,6 +2115,7 @@ async def verify_installation(qualified_name: str) -> Dict[str, Any]:
         sanitized_name = _sanitize_mcp_name(qualified_name_clean)
         found = False
         found_name = None
+        found_mcp_entry = None
         
         for mcp_entry in config_result.get("installed_mcps", []):
             entry_name = mcp_entry.get("name", "")
@@ -1099,22 +2129,40 @@ async def verify_installation(qualified_name: str) -> Dict[str, Any]:
                 _is_exact_match_in_args(sanitized_name, entry_args)):
                 found = True
                 found_name = entry_name
+                found_mcp_entry = mcp_entry
                 break
         
-        if found:
-            message = f"MCP '{qualified_name_clean}' is installed as '{found_name}'"
-        else:
-            message = f"MCP '{qualified_name_clean}' is not installed. Expected sanitized name: '{sanitized_name}'"
-        
-        return {
+        # Build response with hot-reload information
+        response = {
             "status": "success",
             "verified": found,
             "qualified_name": qualified_name_clean,
             "sanitized_name": sanitized_name,
             "found_name": found_name,
-            "config_path": config_result.get("config_path"),
-            "message": message
+            "config_path": config_result.get("config_path")
         }
+        
+        if found and found_mcp_entry:
+            # Add hot-reload status information
+            hot_reload_enabled = found_mcp_entry.get("hot_reload_enabled", False)
+            response["hot_reload_enabled"] = hot_reload_enabled
+            
+            if hot_reload_enabled:
+                response["hot_reload_info"] = {
+                    "original_command": found_mcp_entry.get("original_command"),
+                    "original_args": found_mcp_entry.get("original_args"),
+                    "wrapped_command": found_mcp_entry.get("command"),
+                    "wrapped_args": found_mcp_entry.get("args")
+                }
+                message = f"MCP '{qualified_name_clean}' is installed as '{found_name}' with hot-reload enabled"
+            else:
+                message = f"MCP '{qualified_name_clean}' is installed as '{found_name}' (hot-reload disabled)"
+        else:
+            message = f"MCP '{qualified_name_clean}' is not installed. Expected sanitized name: '{sanitized_name}'"
+            response["hot_reload_enabled"] = False
+        
+        response["message"] = message
+        return response
         
     except Exception as e:
         return {
