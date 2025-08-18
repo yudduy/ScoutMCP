@@ -8,9 +8,6 @@ and managing Model Context Protocol (MCP) servers using the Smithery Registry AP
 This server follows the principle of separation of concerns:
 - MCP Scout: Pure search and installation engine (no opinions)
 - Claude Code: Intelligence, orchestration, and user preferences
-
-Author: MCP Scout Team
-Version: 2.0
 """
 
 import base64
