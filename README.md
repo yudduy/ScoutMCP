@@ -86,7 +86,7 @@ claude mcp add ScoutMCP -- python /path/to/ScoutMCP/server.py
 
 ```bash
 # Clone the repo
-git clone https://github.com/yudduy/mcp-scout.git
+git clone https://github.com/yudduy/ScoutMCP.git
 cd mcp-scout
 
 # Install Python dependencies (make sure you're using Python 3.10+)
